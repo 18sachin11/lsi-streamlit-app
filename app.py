@@ -97,7 +97,14 @@ if uploaded_landslide_zip and uploaded_nonlandslide_zip:
         gdf_ls['label'] = 1
         gdf_nls['label'] = 0
         points_df = pd.concat([gdf_ls, gdf_nls], ignore_index=True)
-        st.map(points_df)
+
+# Extract latitude and longitude
+        points_df['longitude'] = points_df.geometry.x
+        points_df['latitude'] = points_df.geometry.y
+
+# Now pass only lat-lon columns to st.map
+        st.map(points_df[['latitude', 'longitude']])
+
         st.success("Points loaded successfully.")
 
 # Step 3: Select ML Models
