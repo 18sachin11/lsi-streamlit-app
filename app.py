@@ -19,6 +19,7 @@ import os
 import zipfile
 from rasterio.enums import Resampling
 from rasterio.transform import from_origin
+from pyproj import Transformer
 
 st.set_page_config(page_title="Landslide Susceptibility Mapping App", layout="wide")
 st.title("🌍 Landslide Susceptibility Mapping using Machine Learning")
@@ -46,8 +47,32 @@ if uploaded_layers and len(uploaded_layers) == num_layers:
             tmp_path = tmp.name
             with rasterio.open(tmp_path) as src:
                 data = src.read(1)
-                fig, ax = plt.subplots()
+                bounds = src.bounds
+                extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
+
+                fig, ax = plt.subplots(figsize=(4, 3))
                 rasterio.plot.show(src, ax=ax, title=f"Layer {i+1}")
+
+                # If in UTM, convert to Lat/Lon using pyproj
+                if src.crs.to_epsg() != 4326:
+                    transformer = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True)
+                    (minx, miny), (maxx, maxy) = ((bounds.left, bounds.bottom), (bounds.right, bounds.top))
+                    lon_min, lat_min = transformer.transform(minx, miny)
+                    lon_max, lat_max = transformer.transform(maxx, maxy)
+                    xticks = np.round(np.linspace(lon_min, lon_max, 5), 2)
+                    yticks = np.round(np.linspace(lat_min, lat_max, 5), 2)
+                    ax.set_xticks(xticks)
+                    ax.set_yticks(yticks)
+                    ax.set_xlabel("Longitude (°)")
+                    ax.set_ylabel("Latitude (°)")
+                    ax.grid(True, linestyle='--', alpha=0.5)
+                else:
+                    ax.set_xticks(np.round(np.linspace(extent[0], extent[1], 5), 2))
+                    ax.set_yticks(np.round(np.linspace(extent[2], extent[3], 5), 2))
+                    ax.set_xlabel("Longitude (°)")
+                    ax.set_ylabel("Latitude (°)")
+                    ax.grid(True, linestyle='--', alpha=0.5)
+
                 st.pyplot(fig)
                 rasters[f"layer_{i+1}"] = (data, src.transform, src.crs)
 
@@ -88,12 +113,14 @@ model_options = {
 
 selected_models = st.multiselect("Select models:", list(model_options.keys()))
 
-# Step 4: Generate LSI
+# Step 4: Optional: Show grid before generating maps
+show_grid = st.checkbox("Optionally show map grids before generating LSI")
+
+# Step 5: Button to trigger generation
 if st.button("Generate LSI Maps") and selected_models:
     if rasters and points_df is not None:
         feature_names = list(rasters.keys())
 
-        # Extract features at point locations
         for i, (layer_key, (data, transform, crs)) in enumerate(rasters.items()):
             values = []
             for geom in points_df.geometry:
@@ -116,6 +143,7 @@ if st.button("Generate LSI Maps") and selected_models:
         output_files = []
         height, width = list(rasters.values())[0][0].shape
         transform = list(rasters.values())[0][1]
+        crs = list(rasters.values())[0][2]
 
         for model_name in selected_models:
             model = model_options[model_name]
@@ -139,15 +167,32 @@ if st.button("Generate LSI Maps") and selected_models:
             out_path = f"{model_name.replace(' ', '_')}_LSI.tif"
             output_files.append(out_path)
             with rasterio.open(out_path, 'w', driver='GTiff', height=height, width=width,
-                               count=1, dtype='float32', crs=list(rasters.values())[0][2],
+                               count=1, dtype='float32', crs=crs,
                                transform=transform, nodata=-9999.0) as dst:
                 dst.write(np.where(np.isnan(prob_map), -9999.0, prob_map).astype(np.float32), 1)
 
             # Display map
             st.markdown(f"**{model_name} LSI Map**")
-            fig, ax = plt.subplots(figsize=(6, 5))
+            fig, ax = plt.subplots(figsize=(5, 4))
             img = ax.imshow(np.ma.masked_where(np.isnan(prob_map), prob_map), cmap='RdYlBu', vmin=0, vmax=1)
             plt.colorbar(img, ax=ax, label='Susceptibility')
+
+            if show_grid:
+                bounds = rasterio.transform.array_bounds(height, width, transform)
+                if crs.to_epsg() != 4326:
+                    transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+                    lon_min, lat_min = transformer.transform(bounds[0], bounds[1])
+                    lon_max, lat_max = transformer.transform(bounds[2], bounds[3])
+                    ax.set_xticks(np.round(np.linspace(lon_min, lon_max, 6), 2))
+                    ax.set_yticks(np.round(np.linspace(lat_min, lat_max, 6), 2))
+                else:
+                    ax.set_xticks(np.round(np.linspace(bounds[0], bounds[2], 6), 2))
+                    ax.set_yticks(np.round(np.linspace(bounds[1], bounds[3], 6), 2))
+
+                ax.set_xlabel("Longitude (°)")
+                ax.set_ylabel("Latitude (°)")
+                ax.grid(True, linestyle='--', alpha=0.5)
+
             st.pyplot(fig)
 
         # Create zip
@@ -158,7 +203,7 @@ if st.button("Generate LSI Maps") and selected_models:
         with open("LSI_outputs.zip", "rb") as f:
             st.download_button("Download All LSI Maps (ZIP)", f, file_name="LSI_outputs.zip")
 
-# Step 5: GitHub Deployment Instructions
+# Step 6: GitHub Deployment Instructions
 st.markdown("---")
 st.markdown("### 🚀 How to Deploy This App to GitHub")
 st.markdown("""
