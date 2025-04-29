@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import roc_curve, auc, classification_report
+from sklearn.metrics import roc_curve, auc
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
@@ -24,24 +24,19 @@ st.set_page_config(page_title="Landslide Susceptibility Mapping App", layout="wi
 st.title("🌍 Landslide Susceptibility Mapping using Machine Learning")
 
 st.markdown("""
-This web app allows you to upload raster layers and landslide/non-landslide points,
-select machine learning models, and generate a Landslide Susceptibility Index (LSI) map.
+Upload raster layers and zipped shapefiles (with .shp, .shx, .dbf, .prj), select ML models, and generate a Landslide Susceptibility Index (LSI) map.
 """)
 
-# Step 1: User Input - Number of Layers
-num_layers = st.number_input("Step 1: Enter the number of input layers:", min_value=1, max_value=20, value=5)
+# Step 1: Upload raster layers
+num_layers = st.number_input("Step 1: Enter number of raster layers:", min_value=1, max_value=20, value=5)
+uploaded_layers = st.file_uploader("Upload raster layers (GeoTIFFs):", type=['tif'], accept_multiple_files=True)
 
-# Step 2: Upload raster layers
-uploaded_layers = st.file_uploader("Step 2: Upload raster layers (GeoTIFF format):", type=['tif'], accept_multiple_files=True)
+# Step 2: Upload zipped shapefiles for landslide and non-landslide points
+uploaded_landslide_zip = st.file_uploader("Upload zipped Landslide Shapefile:", type=['zip'])
+uploaded_nonlandslide_zip = st.file_uploader("Upload zipped Non-Landslide Shapefile:", type=['zip'])
 
-# Step 3: Upload landslide and non-landslide shapefiles
-uploaded_landslide = st.file_uploader("Upload Landslide Points (Shapefile .shp):", type=['shp'])
-uploaded_nonlandslide = st.file_uploader("Upload Non-Landslide Points (Shapefile .shp):", type=['shp'])
-
-# Placeholder for loaded rasters and points
 rasters = {}
 points_df = None
-layer_paths = []
 
 if uploaded_layers and len(uploaded_layers) == num_layers:
     st.success(f"{len(uploaded_layers)} raster layers uploaded.")
@@ -49,7 +44,6 @@ if uploaded_layers and len(uploaded_layers) == num_layers:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".tif") as tmp:
             tmp.write(file.read())
             tmp_path = tmp.name
-            layer_paths.append(tmp_path)
             with rasterio.open(tmp_path) as src:
                 data = src.read(1)
                 fig, ax = plt.subplots()
@@ -57,26 +51,32 @@ if uploaded_layers and len(uploaded_layers) == num_layers:
                 st.pyplot(fig)
                 rasters[f"layer_{i+1}"] = (data, src.transform, src.crs)
 
-if uploaded_landslide and uploaded_nonlandslide:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        shp_path_ls = os.path.join(tmpdir, "landslide.shp")
-        shp_path_nls = os.path.join(tmpdir, "nonlandslide.shp")
-        with open(shp_path_ls, 'wb') as f:
-            f.write(uploaded_landslide.read())
-        with open(shp_path_nls, 'wb') as f:
-            f.write(uploaded_nonlandslide.read())
+# Helper function to extract zipped shapefile
+@st.cache_data
+def unzip_shapefile(uploaded_zip):
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        zpath = os.path.join(tmpdirname, "uploaded.zip")
+        with open(zpath, "wb") as f:
+            f.write(uploaded_zip.getbuffer())
+        with zipfile.ZipFile(zpath, 'r') as zip_ref:
+            zip_ref.extractall(tmpdirname)
+        shp_files = [os.path.join(tmpdirname, f) for f in os.listdir(tmpdirname) if f.endswith('.shp')]
+        if shp_files:
+            return gpd.read_file(shp_files[0])
+    return None
 
-        gdf_ls = gpd.read_file(shp_path_ls)
-        gdf_nls = gpd.read_file(shp_path_nls)
+if uploaded_landslide_zip and uploaded_nonlandslide_zip:
+    gdf_ls = unzip_shapefile(uploaded_landslide_zip)
+    gdf_nls = unzip_shapefile(uploaded_nonlandslide_zip)
+    if gdf_ls is not None and gdf_nls is not None:
         gdf_ls['label'] = 1
         gdf_nls['label'] = 0
-        points_df = pd.concat([gdf_ls, gdf_nls])
-
+        points_df = pd.concat([gdf_ls, gdf_nls], ignore_index=True)
         st.map(points_df)
-        st.success("Points uploaded and visualized.")
+        st.success("Points loaded successfully.")
 
-# Step 4: Select Machine Learning Models
-st.markdown("### Step 4: Select Machine Learning Models")
+# Step 3: Select ML Models
+st.markdown("### Step 3: Select Machine Learning Models")
 model_options = {
     "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
     "Logistic Regression": LogisticRegression(max_iter=1000),
@@ -86,10 +86,10 @@ model_options = {
     "LightGBM": lgb.LGBMClassifier()
 }
 
-selected_models = st.multiselect("Select models to use:", list(model_options.keys()))
+selected_models = st.multiselect("Select models:", list(model_options.keys()))
 
-# Step 5: Generate LSI and Export
-if st.button("Step 5: Generate Final LSI Maps") and selected_models:
+# Step 4: Generate LSI
+if st.button("Generate LSI Maps") and selected_models:
     if rasters and points_df is not None:
         feature_names = list(rasters.keys())
 
@@ -97,11 +97,11 @@ if st.button("Step 5: Generate Final LSI Maps") and selected_models:
         for i, (layer_key, (data, transform, crs)) in enumerate(rasters.items()):
             values = []
             for geom in points_df.geometry:
-                row, col = ~transform * (geom.x, geom.y)
-                row, col = int(row), int(col)
                 try:
+                    row, col = ~transform * (geom.x, geom.y)
+                    row, col = int(row), int(col)
                     values.append(data[row, col])
-                except IndexError:
+                except Exception:
                     values.append(np.nan)
             points_df[layer_key] = values
 
@@ -136,7 +136,6 @@ if st.button("Step 5: Generate Final LSI Maps") and selected_models:
             prob_map[valid_mask] = model.predict_proba(flat_layers_scaled)[:, 1]
             prob_map = prob_map.reshape((height, width))
 
-            # Save GeoTIFF
             out_path = f"{model_name.replace(' ', '_')}_LSI.tif"
             output_files.append(out_path)
             with rasterio.open(out_path, 'w', driver='GTiff', height=height, width=width,
@@ -144,7 +143,7 @@ if st.button("Step 5: Generate Final LSI Maps") and selected_models:
                                transform=transform, nodata=-9999.0) as dst:
                 dst.write(np.where(np.isnan(prob_map), -9999.0, prob_map).astype(np.float32), 1)
 
-            # Display
+            # Display map
             st.markdown(f"**{model_name} LSI Map**")
             fig, ax = plt.subplots(figsize=(6, 5))
             img = ax.imshow(np.ma.masked_where(np.isnan(prob_map), prob_map), cmap='RdYlBu', vmin=0, vmax=1)
@@ -159,14 +158,11 @@ if st.button("Step 5: Generate Final LSI Maps") and selected_models:
         with open("LSI_outputs.zip", "rb") as f:
             st.download_button("Download All LSI Maps (ZIP)", f, file_name="LSI_outputs.zip")
 
-# Step 6: Help Section for GitHub Deployment
+# Step 5: GitHub Deployment Instructions
 st.markdown("---")
 st.markdown("### 🚀 How to Deploy This App to GitHub")
 st.markdown("""
-1. Create a new GitHub repository.
-2. Upload all your code files (`app.py`, `requirements.txt`, etc.)
-3. In your repository, go to [Streamlit Community Cloud](https://streamlit.io/cloud) and sign in.
-4. Click "New app" and connect your GitHub repo.
-5. Select `app.py` as the entry point and click **Deploy**.
-6. Your app will be live at `https://yourname.streamlit.app` 🌐
+1. Create a GitHub repository.
+2. Upload your files (`app.py`, `requirements.txt`).
+3. Go to [Streamlit Community Cloud](https://streamlit.io/cloud) and deploy.
 """)
