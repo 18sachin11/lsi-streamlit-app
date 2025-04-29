@@ -18,9 +18,9 @@ import tempfile
 import os
 import zipfile
 from rasterio.enums import Resampling
-from rasterio.transform import from_origin
 from pyproj import Transformer
 
+# Streamlit configuration
 st.set_page_config(page_title="Landslide Susceptibility Mapping App", layout="wide")
 st.title("🌍 Landslide Susceptibility Mapping using Machine Learning")
 
@@ -31,6 +31,9 @@ Upload raster layers and zipped shapefiles (with .shp, .shx, .dbf, .prj), select
 # Step 1: Upload raster layers
 num_layers = st.number_input("Step 1: Enter number of raster layers:", min_value=1, max_value=20, value=5)
 uploaded_layers = st.file_uploader("Upload raster layers (GeoTIFFs):", type=['tif'], accept_multiple_files=True)
+
+# Optionally preview uploaded maps
+show_input_maps = st.checkbox("Optionally show preview of uploaded raster layers")
 
 # Step 2: Upload zipped shapefiles for landslide and non-landslide points
 uploaded_landslide_zip = st.file_uploader("Upload zipped Landslide Shapefile:", type=['zip'])
@@ -49,34 +52,29 @@ if uploaded_layers and len(uploaded_layers) == num_layers:
                 data = src.read(1)
                 bounds = src.bounds
                 extent = [bounds.left, bounds.right, bounds.bottom, bounds.top]
-
-                fig, ax = plt.subplots(figsize=(4, 3))
-                rasterio.plot.show(src, ax=ax, title=f"Layer {i+1}")
-
-                # If in UTM, convert to Lat/Lon using pyproj
-                if src.crs.to_epsg() != 4326:
-                    transformer = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True)
-                    (minx, miny), (maxx, maxy) = ((bounds.left, bounds.bottom), (bounds.right, bounds.top))
-                    lon_min, lat_min = transformer.transform(minx, miny)
-                    lon_max, lat_max = transformer.transform(maxx, maxy)
-                    xticks = np.round(np.linspace(lon_min, lon_max, 5), 2)
-                    yticks = np.round(np.linspace(lat_min, lat_max, 5), 2)
-                    ax.set_xticks(xticks)
-                    ax.set_yticks(yticks)
-                    ax.set_xlabel("Longitude (°)")
-                    ax.set_ylabel("Latitude (°)")
-                    ax.grid(True, linestyle='--', alpha=0.5)
-                else:
-                    ax.set_xticks(np.round(np.linspace(extent[0], extent[1], 5), 2))
-                    ax.set_yticks(np.round(np.linspace(extent[2], extent[3], 5), 2))
-                    ax.set_xlabel("Longitude (°)")
-                    ax.set_ylabel("Latitude (°)")
-                    ax.grid(True, linestyle='--', alpha=0.5)
-
-                st.pyplot(fig)
                 rasters[f"layer_{i+1}"] = (data, src.transform, src.crs)
 
-# Helper function to extract zipped shapefile
+                if show_input_maps:
+                    fig, ax = plt.subplots(figsize=(4, 3))
+                    rasterio.plot.show(src, ax=ax, title=f"Layer {i+1}")
+
+                    if src.crs.to_epsg() != 4326:
+                        transformer = Transformer.from_crs(src.crs, "EPSG:4326", always_xy=True)
+                        lon_min, lat_min = transformer.transform(bounds.left, bounds.bottom)
+                        lon_max, lat_max = transformer.transform(bounds.right, bounds.top)
+                        xticks = np.round(np.linspace(lon_min, lon_max, 5), 2)
+                        yticks = np.round(np.linspace(lat_min, lat_max, 5), 2)
+                        ax.set_xticks(xticks)
+                        ax.set_yticks(yticks)
+                    else:
+                        ax.set_xticks(np.round(np.linspace(extent[0], extent[1], 5), 2))
+                        ax.set_yticks(np.round(np.linspace(extent[2], extent[3], 5), 2))
+
+                    ax.set_xlabel("Longitude (°)")
+                    ax.set_ylabel("Latitude (°)")
+                    ax.grid(True, linestyle='--', alpha=0.5)
+                    st.pyplot(fig)
+
 @st.cache_data
 def unzip_shapefile(uploaded_zip):
     with tempfile.TemporaryDirectory() as tmpdirname:
@@ -97,14 +95,10 @@ if uploaded_landslide_zip and uploaded_nonlandslide_zip:
         gdf_ls['label'] = 1
         gdf_nls['label'] = 0
         points_df = pd.concat([gdf_ls, gdf_nls], ignore_index=True)
-
-# Extract latitude and longitude
+        points_df = points_df.to_crs(epsg=4326)
         points_df['longitude'] = points_df.geometry.x
         points_df['latitude'] = points_df.geometry.y
-
-# Now pass only lat-lon columns to st.map
         st.map(points_df[['latitude', 'longitude']])
-
         st.success("Points loaded successfully.")
 
 # Step 3: Select ML Models
@@ -120,10 +114,10 @@ model_options = {
 
 selected_models = st.multiselect("Select models:", list(model_options.keys()))
 
-# Step 4: Optional: Show grid before generating maps
-show_grid = st.checkbox("Optionally show map grids before generating LSI")
+# Step 4: Optional Grid Display
+show_grid = st.checkbox("Optionally show grid in LSI output maps")
 
-# Step 5: Button to trigger generation
+# Step 5: Run model and generate maps
 if st.button("Generate LSI Maps") and selected_models:
     if rasters and points_df is not None:
         feature_names = list(rasters.keys())
@@ -178,7 +172,6 @@ if st.button("Generate LSI Maps") and selected_models:
                                transform=transform, nodata=-9999.0) as dst:
                 dst.write(np.where(np.isnan(prob_map), -9999.0, prob_map).astype(np.float32), 1)
 
-            # Display map
             st.markdown(f"**{model_name} LSI Map**")
             fig, ax = plt.subplots(figsize=(5, 4))
             img = ax.imshow(np.ma.masked_where(np.isnan(prob_map), prob_map), cmap='RdYlBu', vmin=0, vmax=1)
@@ -202,7 +195,6 @@ if st.button("Generate LSI Maps") and selected_models:
 
             st.pyplot(fig)
 
-        # Create zip
         with zipfile.ZipFile("LSI_outputs.zip", 'w') as zipf:
             for file in output_files:
                 zipf.write(file)
@@ -210,11 +202,11 @@ if st.button("Generate LSI Maps") and selected_models:
         with open("LSI_outputs.zip", "rb") as f:
             st.download_button("Download All LSI Maps (ZIP)", f, file_name="LSI_outputs.zip")
 
-# Step 6: GitHub Deployment Instructions
+# Step 6: Deployment help
 st.markdown("---")
 st.markdown("### 🚀 How to Deploy This App to GitHub")
 st.markdown("""
 1. Create a GitHub repository.
-2. Upload your files (`app.py`, `requirements.txt`).
-3. Go to [Streamlit Community Cloud](https://streamlit.io/cloud) and deploy.
+2. Upload your files (`app.py`, `requirements.txt`, `setup.sh`).
+3. Deploy via [Streamlit Cloud](https://streamlit.io/cloud) or [Render.com](https://render.com).
 """)
