@@ -4,139 +4,173 @@ import rasterio
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve, auc
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 import lightgbm as lgb
-import tempfile
-import os
-import zipfile
+import tempfile, os, zipfile
 from pyproj import Transformer
 from rasterio.enums import Resampling
 
+# ─── UI SETUP ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="LSI Mapping App", layout="wide")
 st.title("🌍 Landslide Susceptibility Mapping")
 
-st.markdown("""
-Upload raster layers and zipped shapefiles (with .shp, .shx, .dbf, .prj), select ML models, and generate a Landslide Susceptibility Index (LSI) map.
+st.sidebar.header("Instructions")
+st.sidebar.markdown("""
+1. Upload your raster layers (GeoTIFF).
+2. Upload zipped shapefiles for landslide & non-landslide points.
+3. (Optional) Preview rasters.
+4. Select which ML models to run.
+5. Train, evaluate, view SHAP & correlation.
+6. Generate susceptibility maps & download.
 """)
 
-# --- Upload Inputs ---
-st.markdown("### Step 1: Upload Raster Layers")
-num_layers = st.number_input("Number of raster layers:", 1, 20, 6)
-uploaded_layers = st.file_uploader("Upload GeoTIFF layers:", type="tif", accept_multiple_files=True)
-
-st.markdown("### Step 2: Upload Landslide & Non-Landslide Shapefiles")
-uploaded_ls = st.file_uploader("Landslide points (ZIP):", type="zip")
-uploaded_nls = st.file_uploader("Non-landslide points (ZIP):", type="zip")
+# ─── UPLOAD ────────────────────────────────────────────────────────────────
+st.header("1️⃣ Upload Data")
+num_layers = st.number_input("Number of raster layers:", 1, 20, 5)
+layers_in = st.file_uploader("GeoTIFF layers:", type="tif", accept_multiple_files=True)
+zip_ls = st.file_uploader("Zipped Landslide .shp/.dbf/.shx/.prj:", type="zip")
+zip_nls = st.file_uploader("Zipped Non-Landslide:", type="zip")
+preview = st.checkbox("Preview rasters")
 
 @st.cache_data
 def unzip_shp(zf):
     with tempfile.TemporaryDirectory() as tmp:
-        p = os.path.join(tmp, "temp.zip")
-        with open(p, "wb") as f: f.write(zf.getbuffer())
-        with zipfile.ZipFile(p, "r") as zip_ref: zip_ref.extractall(tmp)
-        shapes = [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(".shp")]
-        return gpd.read_file(shapes[0]) if shapes else None
+        path = os.path.join(tmp, "u.zip")
+        with open(path, "wb") as f: f.write(zf.getbuffer())
+        with zipfile.ZipFile(path, "r") as z: z.extractall(tmp)
+        shp = [os.path.join(tmp,f) for f in os.listdir(tmp) if f.endswith(".shp")]
+        return gpd.read_file(shp[0]) if shp else None
 
-# load rasters
-rasters = {}
-meta = None
-raster_crs = None
-if uploaded_layers and len(uploaded_layers)==num_layers:
-    for i, layer in enumerate(uploaded_layers,1):
-        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-            tmp.write(layer.read())
-            with rasterio.open(tmp.name) as src:
-                data = src.read(1)
-                rasters[f"layer_{i}"] = (data, src.transform, src.crs)
-                if meta is None:
-                    meta = src.meta.copy()
-                    raster_crs = src.crs
-
-# load point shapefiles
-points_df = None
-if uploaded_ls and uploaded_nls:
-    gdf_ls  = unzip_shp(uploaded_ls)
-    gdf_nls = unzip_shp(uploaded_nls)
-    if gdf_ls is not None and gdf_nls is not None:
-        gdf_ls["label"] = 1
-        gdf_nls["label"] = 0
-        points_df = pd.concat([gdf_ls, gdf_nls], ignore_index=True)
-        # reproject to raster CRS
-        points_df = points_df.to_crs(raster_crs)
-
-# extract training samples
-if points_df is not None and rasters:
-    feature_keys = list(rasters.keys())
-    for key, (arr, tr, crs) in rasters.items():
-        vals = []
-        for geom in points_df.geometry:
-            try:
-                r,c = ~tr*(geom.x, geom.y)
-                vals.append(arr[int(r),int(c)])
-            except:
-                vals.append(np.nan)
-        points_df[key] = vals
-    points_df.dropna(subset=feature_keys, inplace=True)
-    X = points_df[feature_keys].astype(float)   # all numeric
-    y = points_df["label"]
-
-    # split—no scaling!
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, stratify=y, test_size=0.2, random_state=42
-    )
-
-    st.markdown("### Step 3: Select & Train Models")
-    models = {
-        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
-        "XGBoost":        xgb.XGBClassifier(random_state=42),
-        "LightGBM":       lgb.LGBMClassifier(random_state=42),
-    }
-    selected = st.multiselect("Choose models:", list(models.keys()), default=list(models.keys()))
-
-    if st.button("Generate LSI Maps") and selected:
-        # prepare map export
-        h,w = list(rasters.values())[0][0].shape
-        transform = meta["transform"]
-        out_meta = meta.copy()
-        out_meta.update(dtype="float32", count=1, nodata=-9999.0)
-
-        outputs = []
-        for name in selected:
-            m = models[name]
-            m.fit(X_train, y_train)
-            prob_test = m.predict_proba(X_test)[:,1]
-            fpr,tpr,_ = roc_curve(y_test, prob_test)
-            auc_score = auc(fpr,tpr)
-            st.write(f"**{name} AUC:** {auc_score:.3f}")
-
-            # predict full map
-            stack = np.column_stack([rasters[k][0].flatten() for k in feature_keys])
-            mask = np.any(np.isnan(stack), axis=1)
-            valid = stack[~mask]
-            preds = m.predict_proba(valid)[:,1]
-
-            full = np.full(stack.shape[0], np.nan, dtype="float32")
-            full[~mask] = preds
-            full = full.reshape((h,w))
-            full[np.isnan(full)] = -9999.0
-
-            out_path = f"{name.replace(' ','_')}_LSI.tif"
-            with rasterio.open(out_path, "w", **out_meta) as dst:
-                dst.write(full, 1)
-            outputs.append(out_path)
-
-            # show
-            fig,ax = plt.subplots(figsize=(5,4))
-            im = ax.imshow(np.ma.masked_equal(full, -9999.0), cmap="RdYlBu", vmin=0, vmax=1)
-            fig.colorbar(im, ax=ax, label="Susceptibility")
-            ax.set_title(f"{name} LSI")
+# Load rasters
+rasters, meta, raster_crs = {}, None, None
+if layers_in and len(layers_in)==num_layers:
+    for i, f in enumerate(layers_in,1):
+        tf = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+        tf.write(f.read()); tf.close()
+        with rasterio.open(tf.name) as src:
+            arr = src.read(1)
+            rasters[f"f{i}"] = (arr, src.transform, src.crs)
+            if meta is None:
+                meta, raster_crs = src.meta.copy(), src.crs
+        if preview:
+            fig,ax=plt.subplots(1,1,figsize=(4,3))
+            rasterio.plot.show(arr, transform=src.transform, ax=ax, cmap="terrain")
             st.pyplot(fig)
 
-        # zip & download
-        with zipfile.ZipFile("LSI_outputs.zip","w") as zf:
-            for f in outputs: zf.write(f)
-        with open("LSI_outputs.zip","rb") as f:
-            st.download_button("Download ZIP", f, "LSI_outputs.zip")
+# Load points
+points = None
+if zip_ls and zip_nls:
+    g_ls  = unzip_shp(zip_ls)
+    g_nls = unzip_shp(zip_nls)
+    if g_ls is not None and g_nls is not None:
+        g_ls["label"]=1; g_nls["label"]=0
+        points=gpd.GeoDataFrame(pd.concat([g_ls,g_nls],ignore_index=True))
+        points = points.to_crs(raster_crs)
+
+# ─── SAMPLE ────────────────────────────────────────────────────────────────
+st.header("2️⃣ Sample Rasters at Points")
+if points is not None and rasters:
+    df = points.copy()
+    feats = list(rasters.keys())
+    for k,(arr,tr,crs) in rasters.items():
+        vals=[]
+        for pt in df.geometry:
+            try:
+                r,c=~tr*(pt.x,pt.y); vals.append(arr[int(r),int(c)])
+            except: vals.append(np.nan)
+        df[k]=vals
+    df.dropna(subset=feats,inplace=True)
+    st.write("Sampled points:", df.shape)
+else:
+    st.info("Upload both rasters & zipped shapefiles to sample.")
+
+# ─── TRAIN/EVAL ───────────────────────────────────────────────────────────
+st.header("3️⃣ Train & Evaluate Models")
+if points is not None and rasters:
+    X = df[feats].astype(float)
+    y = df["label"]
+    Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.2,stratify=y,random_state=42)
+
+    models = {
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+        "XGBoost":        xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric="logloss"),
+        "LightGBM":       lgb.LGBMClassifier(random_state=42)
+    }
+    chosen = st.multiselect("Select models to run:", list(models.keys()), default=list(models.keys()))
+    if st.button("Run Models"):
+        results={}
+        for name in chosen:
+            m=models[name]; m.fit(Xtr,ytr)
+            p=m.predict(Xte); pr=m.predict_proba(Xte)[:,1]
+            results[name]=pr
+            # Classification report
+            st.subheader(f"{name} Report")
+            st.text(classification_report(yte,p))
+            # Confusion Matrix
+            cm=confusion_matrix(yte,p)
+            fig,ax=plt.subplots(figsize=(3,2))
+            sns.heatmap(cm,annot=True,fmt="d",ax=ax)
+            ax.set_title(f"{name} Confusion")
+            st.pyplot(fig)
+        # ROC curves
+        fig,ax=plt.subplots(figsize=(5,4))
+        for name,pr in results.items():
+            fpr,tpr,_=roc_curve(yte,pr); ax.plot(fpr,tpr,label=f"{name} (AUC={auc(fpr,tpr):.2f})")
+        ax.plot([0,1],[0,1],'--',color='gray'); ax.legend()
+        st.pyplot(fig)
+
+        # SHAP feature importance (for tree models)
+        st.subheader("Feature Importance (SHAP)")
+        expl = shap.TreeExplainer(models[chosen[0]])
+        sv = expl.shap_values(Xtr)
+        fig = shap.summary_plot(sv, Xtr, plot_type="bar", show=False)
+        st.pyplot(bbox_inches="tight")
+
+        # Correlation matrix
+        st.subheader("Correlation Matrix")
+        fig,ax=plt.subplots(figsize=(5,4))
+        sns.heatmap(X.corr(),annot=True,cmap="coolwarm",ax=ax)
+        st.pyplot(fig)
+
+        # ─── FULL-AREA PREDICTION ─────────────────────────────────────────
+        st.header("4️⃣ Full-Area Susceptibility Maps")
+        h,w=next(iter(rasters.values()))[0].shape
+        trn=meta["transform"]; crs=meta["crs"]
+        om=meta.copy(); om.update(dtype="float32",count=1,nodata=-9999.0)
+        ensemble=[]
+        for name in chosen:
+            m=models[name]
+            stack=np.column_stack([rasters[k][0].flatten() for k in feats])
+            mask=np.any(stack< -1e10,axis=1)
+            valid=stack[~mask]
+            preds=m.predict_proba(valid)[:,1]
+            full=np.full(mask.shape, np.nan)
+            full[~mask]=preds; full=full.reshape((h,w))
+            full[np.isnan(full)]=-9999.0
+            path=f"{name.replace(' ','_')}_LSI.tif"
+            with rasterio.open(path,"w",**om) as dst:
+                dst.write(full.astype("float32"),1)
+            ensemble.append(full)
+            st.subheader(f"{name} Susceptibility Map")
+            fig,ax=plt.subplots(figsize=(4,3))
+            ax.imshow(full, cmap="RdYlBu", vmin=0, vmax=1)
+            st.pyplot(fig)
+
+        # Ensemble average
+        st.subheader("Ensemble Mean Map")
+        avg = np.nanmean(np.stack(ensemble),axis=0)
+        fig,ax=plt.subplots(figsize=(4,3))
+        ax.imshow(avg, cmap="RdYlBu", vmin=0, vmax=1)
+        st.pyplot(fig)
+        # download ZIP
+        with zipfile.ZipFile("LSI_maps.zip","w") as zf:
+            for name in chosen:
+                zf.write(f"{name.replace(' ','_')}_LSI.tif")
+            zf.write("LSI_maps.zip")
+        with open("LSI_maps.zip","rb") as f:
+            st.download_button("Download All Maps",f,"LSI_maps.zip")
