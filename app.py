@@ -12,7 +12,6 @@ from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 import lightgbm as lgb
 import tempfile, os, zipfile
-from pyproj import Transformer
 from rasterio.enums import Resampling
 
 # ─── UI SETUP ─────────────────────────────────────────────────────────────
@@ -58,33 +57,38 @@ if layers_in and len(layers_in)==num_layers:
             if meta is None:
                 meta, raster_crs = src.meta.copy(), src.crs
         if preview:
-            fig,ax=plt.subplots(1,1,figsize=(4,3))
+            fig, ax = plt.subplots(figsize=(4,3))
             rasterio.plot.show(arr, transform=src.transform, ax=ax, cmap="terrain")
             st.pyplot(fig)
 
-# Load points
+# Load points and reproject properly
 points = None
 if zip_ls and zip_nls:
     g_ls  = unzip_shp(zip_ls)
     g_nls = unzip_shp(zip_nls)
     if g_ls is not None and g_nls is not None:
-        g_ls["label"]=1; g_nls["label"]=0
-        points=gpd.GeoDataFrame(pd.concat([g_ls,g_nls],ignore_index=True))
-        points = points.to_crs(raster_crs)
+        g_ls["label"] = 1
+        g_nls["label"] = 0
+        points = gpd.GeoDataFrame(pd.concat([g_ls, g_nls], ignore_index=True))
+        # Reproject using EPSG code
+        epsg_code = raster_crs.to_epsg()
+        points = points.to_crs(epsg=epsg_code)
 
 # ─── SAMPLE ────────────────────────────────────────────────────────────────
 st.header("2️⃣ Sample Rasters at Points")
 if points is not None and rasters:
     df = points.copy()
     feats = list(rasters.keys())
-    for k,(arr,tr,crs) in rasters.items():
-        vals=[]
+    for k, (arr, tr, crs) in rasters.items():
+        vals = []
         for pt in df.geometry:
             try:
-                r,c=~tr*(pt.x,pt.y); vals.append(arr[int(r),int(c)])
-            except: vals.append(np.nan)
-        df[k]=vals
-    df.dropna(subset=feats,inplace=True)
+                r, c = ~tr * (pt.x, pt.y)
+                vals.append(arr[int(r), int(c)])
+            except:
+                vals.append(np.nan)
+        df[k] = vals
+    df.dropna(subset=feats, inplace=True)
     st.write("Sampled points:", df.shape)
 else:
     st.info("Upload both rasters & zipped shapefiles to sample.")
@@ -94,7 +98,7 @@ st.header("3️⃣ Train & Evaluate Models")
 if points is not None and rasters:
     X = df[feats].astype(float)
     y = df["label"]
-    Xtr,Xte,ytr,yte = train_test_split(X,y,test_size=0.2,stratify=y,random_state=42)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
     models = {
         "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
@@ -102,75 +106,89 @@ if points is not None and rasters:
         "LightGBM":       lgb.LGBMClassifier(random_state=42)
     }
     chosen = st.multiselect("Select models to run:", list(models.keys()), default=list(models.keys()))
+
     if st.button("Run Models"):
-        results={}
+        results = {}
         for name in chosen:
-            m=models[name]; m.fit(Xtr,ytr)
-            p=m.predict(Xte); pr=m.predict_proba(Xte)[:,1]
-            results[name]=pr
-            # Classification report
+            m = models[name]
+            m.fit(Xtr, ytr)
+            pred = m.predict(Xte)
+            pr   = m.predict_proba(Xte)[:,1]
+            results[name] = pr
+
             st.subheader(f"{name} Report")
-            st.text(classification_report(yte,p))
-            # Confusion Matrix
-            cm=confusion_matrix(yte,p)
-            fig,ax=plt.subplots(figsize=(3,2))
-            sns.heatmap(cm,annot=True,fmt="d",ax=ax)
+            st.text(classification_report(yte, pred))
+
+            cm = confusion_matrix(yte, pred)
+            fig, ax = plt.subplots(figsize=(3,2))
+            sns.heatmap(cm, annot=True, fmt="d", ax=ax)
             ax.set_title(f"{name} Confusion")
             st.pyplot(fig)
+
         # ROC curves
-        fig,ax=plt.subplots(figsize=(5,4))
-        for name,pr in results.items():
-            fpr,tpr,_=roc_curve(yte,pr); ax.plot(fpr,tpr,label=f"{name} (AUC={auc(fpr,tpr):.2f})")
-        ax.plot([0,1],[0,1],'--',color='gray'); ax.legend()
+        fig, ax = plt.subplots(figsize=(5,4))
+        for name, pr in results.items():
+            fpr, tpr, _ = roc_curve(yte, pr)
+            ax.plot(fpr, tpr, label=f"{name} (AUC={auc(fpr,tpr):.2f})")
+        ax.plot([0,1],[0,1], '--', color='gray')
+        ax.legend()
         st.pyplot(fig)
 
-        # SHAP feature importance (for tree models)
+        # SHAP summary plot
         st.subheader("Feature Importance (SHAP)")
         expl = shap.TreeExplainer(models[chosen[0]])
-        sv = expl.shap_values(Xtr)
-        fig = shap.summary_plot(sv, Xtr, plot_type="bar", show=False)
-        st.pyplot(bbox_inches="tight")
+        sv   = expl.shap_values(Xtr)
+        plt.figure(figsize=(8,4))
+        shap.summary_plot(sv, Xtr, plot_type="bar", show=False)
+        st.pyplot(plt.gcf())
 
         # Correlation matrix
         st.subheader("Correlation Matrix")
-        fig,ax=plt.subplots(figsize=(5,4))
-        sns.heatmap(X.corr(),annot=True,cmap="coolwarm",ax=ax)
+        fig, ax = plt.subplots(figsize=(5,4))
+        sns.heatmap(X.corr(), annot=True, cmap="coolwarm", ax=ax)
         st.pyplot(fig)
 
-        # ─── FULL-AREA PREDICTION ─────────────────────────────────────────
+        # ─── FULL-AREA PREDICTION ───────────────────────────────────────
         st.header("4️⃣ Full-Area Susceptibility Maps")
-        h,w=next(iter(rasters.values()))[0].shape
-        trn=meta["transform"]; crs=meta["crs"]
-        om=meta.copy(); om.update(dtype="float32",count=1,nodata=-9999.0)
-        ensemble=[]
+        h, w = next(iter(rasters.values()))[0].shape
+        out_meta = meta.copy()
+        out_meta.update(dtype="float32", count=1, nodata=-9999.0)
+
+        ensemble = []
         for name in chosen:
-            m=models[name]
-            stack=np.column_stack([rasters[k][0].flatten() for k in feats])
-            mask=np.any(stack< -1e10,axis=1)
-            valid=stack[~mask]
-            preds=m.predict_proba(valid)[:,1]
-            full=np.full(mask.shape, np.nan)
-            full[~mask]=preds; full=full.reshape((h,w))
-            full[np.isnan(full)]=-9999.0
-            path=f"{name.replace(' ','_')}_LSI.tif"
-            with rasterio.open(path,"w",**om) as dst:
-                dst.write(full.astype("float32"),1)
+            m = models[name]
+            stack = np.column_stack([rasters[k][0].flatten() for k in feats])
+            mask  = np.any(np.isnan(stack), axis=1)
+            valid = stack[~mask]
+            preds = m.predict_proba(valid)[:,1]
+
+            full = np.full(mask.shape, np.nan, dtype="float32")
+            full[~mask] = preds
+            full = full.reshape((h,w))
+            full[np.isnan(full)] = -9999.0
+
+            path = f"{name.replace(' ','_')}_LSI.tif"
+            with rasterio.open(path, "w", **out_meta) as dst:
+                dst.write(full, 1)
+
             ensemble.append(full)
             st.subheader(f"{name} Susceptibility Map")
-            fig,ax=plt.subplots(figsize=(4,3))
+            fig, ax = plt.subplots(figsize=(4,3))
             ax.imshow(full, cmap="RdYlBu", vmin=0, vmax=1)
             st.pyplot(fig)
 
-        # Ensemble average
+        # Ensemble mean
         st.subheader("Ensemble Mean Map")
-        avg = np.nanmean(np.stack(ensemble),axis=0)
-        fig,ax=plt.subplots(figsize=(4,3))
+        avg = np.nanmean(np.stack(ensemble), axis=0)
+        fig, ax = plt.subplots(figsize=(4,3))
         ax.imshow(avg, cmap="RdYlBu", vmin=0, vmax=1)
         st.pyplot(fig)
-        # download ZIP
-        with zipfile.ZipFile("LSI_maps.zip","w") as zf:
+
+        # Download all
+        zip_name = "LSI_maps.zip"
+        with zipfile.ZipFile(zip_name, "w") as zf:
             for name in chosen:
-                zf.write(f"{name.replace(' ','_')}_LSI.tif")
-            zf.write("LSI_maps.zip")
-        with open("LSI_maps.zip","rb") as f:
-            st.download_button("Download All Maps",f,"LSI_maps.zip")
+                tif = f"{name.replace(' ','_')}_LSI.tif"
+                zf.write(tif)
+        with open(zip_name, "rb") as f:
+            st.download_button("Download All Maps", f, file_name=zip_name)
