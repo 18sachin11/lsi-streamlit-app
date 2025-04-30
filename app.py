@@ -40,39 +40,43 @@ preview = st.checkbox("Preview rasters")
 def unzip_shp(zf):
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "u.zip")
-        with open(path, "wb") as f: f.write(zf.getbuffer())
-        with zipfile.ZipFile(path, "r") as z: z.extractall(tmp)
-        shp = [os.path.join(tmp,f) for f in os.listdir(tmp) if f.endswith(".shp")]
+        with open(path, "wb") as f:
+            f.write(zf.getbuffer())
+        with zipfile.ZipFile(path, "r") as z:
+            z.extractall(tmp)
+        shp = [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(".shp")]
         return gpd.read_file(shp[0]) if shp else None
 
 # Load rasters
 rasters, meta, raster_crs = {}, None, None
-if layers_in and len(layers_in)==num_layers:
-    for i, f in enumerate(layers_in,1):
-        tf = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
-        tf.write(f.read()); tf.close()
-        with rasterio.open(tf.name) as src:
+if layers_in and len(layers_in) == num_layers:
+    for i, f in enumerate(layers_in, 1):
+        tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+        tmp.write(f.read()); tmp.close()
+        with rasterio.open(tmp.name) as src:
             arr = src.read(1)
             rasters[f"f{i}"] = (arr, src.transform, src.crs)
             if meta is None:
                 meta, raster_crs = src.meta.copy(), src.crs
         if preview:
-            fig, ax = plt.subplots(figsize=(4,3))
+            fig, ax = plt.subplots(figsize=(4, 3))
             rasterio.plot.show(arr, transform=src.transform, ax=ax, cmap="terrain")
             st.pyplot(fig)
 
-# Load points and reproject properly
+# Load points (only after rasters loaded)
 points = None
 if zip_ls and zip_nls:
-    g_ls  = unzip_shp(zip_ls)
-    g_nls = unzip_shp(zip_nls)
-    if g_ls is not None and g_nls is not None:
-        g_ls["label"] = 1
-        g_nls["label"] = 0
-        points = gpd.GeoDataFrame(pd.concat([g_ls, g_nls], ignore_index=True))
-        # Reproject using EPSG code
-        epsg_code = raster_crs.to_epsg()
-        points = points.to_crs(epsg=epsg_code)
+    if raster_crs is None:
+        st.error("⚠️ Please upload all raster layers first, then upload your point shapefiles.")
+    else:
+        g_ls = unzip_shp(zip_ls)
+        g_nls = unzip_shp(zip_nls)
+        if g_ls is not None and g_nls is not None:
+            g_ls["label"] = 1
+            g_nls["label"] = 0
+            points = gpd.GeoDataFrame(pd.concat([g_ls, g_nls], ignore_index=True))
+            epsg_code = raster_crs.to_epsg()
+            points = points.to_crs(epsg=epsg_code)
 
 # ─── SAMPLE ────────────────────────────────────────────────────────────────
 st.header("2️⃣ Sample Rasters at Points")
@@ -113,82 +117,102 @@ if points is not None and rasters:
             m = models[name]
             m.fit(Xtr, ytr)
             pred = m.predict(Xte)
-            pr   = m.predict_proba(Xte)[:,1]
+            pr = m.predict_proba(Xte)[:, 1]
             results[name] = pr
 
             st.subheader(f"{name} Report")
             st.text(classification_report(yte, pred))
 
             cm = confusion_matrix(yte, pred)
-            fig, ax = plt.subplots(figsize=(3,2))
+            fig, ax = plt.subplots(figsize=(3, 2))
             sns.heatmap(cm, annot=True, fmt="d", ax=ax)
             ax.set_title(f"{name} Confusion")
             st.pyplot(fig)
 
-        # ROC curves
-        fig, ax = plt.subplots(figsize=(5,4))
+        fig, ax = plt.subplots(figsize=(5, 4))
         for name, pr in results.items():
             fpr, tpr, _ = roc_curve(yte, pr)
-            ax.plot(fpr, tpr, label=f"{name} (AUC={auc(fpr,tpr):.2f})")
-        ax.plot([0,1],[0,1], '--', color='gray')
+            ax.plot(fpr, tpr, label=f"{name} (AUC={auc(fpr, tpr):.2f})")
+        ax.plot([0, 1], [0, 1], '--', color='gray')
         ax.legend()
         st.pyplot(fig)
 
-        # SHAP summary plot
         st.subheader("Feature Importance (SHAP)")
         expl = shap.TreeExplainer(models[chosen[0]])
-        sv   = expl.shap_values(Xtr)
-        plt.figure(figsize=(8,4))
+        sv = expl.shap_values(Xtr)
+        plt.figure(figsize=(8, 4))
         shap.summary_plot(sv, Xtr, plot_type="bar", show=False)
         st.pyplot(plt.gcf())
 
-        # Correlation matrix
         st.subheader("Correlation Matrix")
-        fig, ax = plt.subplots(figsize=(5,4))
+        fig, ax = plt.subplots(figsize=(5, 4))
         sns.heatmap(X.corr(), annot=True, cmap="coolwarm", ax=ax)
         st.pyplot(fig)
 
-        # ─── FULL-AREA PREDICTION ───────────────────────────────────────
+        # ─── FULL-AREA SUSCEPTIBILITY MAPS ─────────────────────────────────
         st.header("4️⃣ Full-Area Susceptibility Maps")
-        h, w = next(iter(rasters.values()))[0].shape
+
+        # Reference grid
+        ref_arr, ref_transform, ref_crs = next(iter(rasters.values()))
+        height, width = ref_arr.shape
+
+        # Resample all to reference
+        aligned = {}
+        for k, (arr, transform, crs) in rasters.items():
+            if arr.shape == (height, width) and transform == ref_transform and crs == ref_crs:
+                aligned[k] = arr
+            else:
+                dst = np.empty((height, width), dtype=arr.dtype)
+                from rasterio.warp import reproject
+                reproject(
+                    source=arr,
+                    destination=dst,
+                    src_transform=transform,
+                    src_crs=crs,
+                    dst_transform=ref_transform,
+                    dst_crs=ref_crs,
+                    resampling=Resampling.nearest
+                )
+                aligned[k] = dst
+
+        # Build stack
+        stack = np.column_stack([aligned[k].flatten() for k in feats])
+        mask = np.any(np.isnan(stack), axis=1)
+        valid = stack[~mask]
+
         out_meta = meta.copy()
         out_meta.update(dtype="float32", count=1, nodata=-9999.0)
 
         ensemble = []
         for name in chosen:
             m = models[name]
-            stack = np.column_stack([rasters[k][0].flatten() for k in feats])
-            mask  = np.any(np.isnan(stack), axis=1)
-            valid = stack[~mask]
-            preds = m.predict_proba(valid)[:,1]
+            probs = m.predict_proba(valid)[:, 1]
 
-            full = np.full(mask.shape, np.nan, dtype="float32")
-            full[~mask] = preds
-            full = full.reshape((h,w))
+            full = np.full(stack.shape[0], np.nan, dtype="float32")
+            full[~mask] = probs
+            full = full.reshape((height, width))
             full[np.isnan(full)] = -9999.0
 
-            path = f"{name.replace(' ','_')}_LSI.tif"
+            path = f"{name.replace(' ', '_')}_LSI.tif"
             with rasterio.open(path, "w", **out_meta) as dst:
                 dst.write(full, 1)
 
             ensemble.append(full)
             st.subheader(f"{name} Susceptibility Map")
-            fig, ax = plt.subplots(figsize=(4,3))
+            fig, ax = plt.subplots(figsize=(4, 3))
             ax.imshow(full, cmap="RdYlBu", vmin=0, vmax=1)
             st.pyplot(fig)
 
-        # Ensemble mean
         st.subheader("Ensemble Mean Map")
         avg = np.nanmean(np.stack(ensemble), axis=0)
-        fig, ax = plt.subplots(figsize=(4,3))
+        fig, ax = plt.subplots(figsize=(4, 3))
         ax.imshow(avg, cmap="RdYlBu", vmin=0, vmax=1)
         st.pyplot(fig)
 
-        # Download all
         zip_name = "LSI_maps.zip"
         with zipfile.ZipFile(zip_name, "w") as zf:
             for name in chosen:
-                tif = f"{name.replace(' ','_')}_LSI.tif"
+                tif = f"{name.replace(' ', '_')}_LSI.tif"
                 zf.write(tif)
         with open(zip_name, "rb") as f:
             st.download_button("Download All Maps", f, file_name=zip_name)
