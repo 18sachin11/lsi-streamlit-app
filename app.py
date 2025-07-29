@@ -109,21 +109,32 @@ if layers_in and len(layers_in) == num_layers:
 
 # ─── 2️⃣ LOAD & REPROJECT POINTS ───────────────────────────────────────────
 points = None
+# Load & reproject point shapefiles
 if zip_ls and zip_nls:
     if raster_crs is None:
         st.error("Upload rasters first, then shapefiles.")
     else:
-        g_ls  = unzip_shp(zip_ls)
-        g_nls = unzip_shp(zip_nls)
-        if g_ls is None or g_nls is None:
+        gls  = unzip_shp(zip_ls)
+        gnls = unzip_shp(zip_nls)
+        if gls is None or gnls is None:
             st.error("Could not read shapefiles.")
         else:
-            g_ls["label"], g_nls["label"] = 1, 0
-            merged = pd.concat([g_ls, g_nls], ignore_index=True)
-            # Preserve geometry & CRS
-            points = gpd.GeoDataFrame(merged, geometry="geometry", crs=g_ls.crs)
-            # Reproject to raster CRS
+            # 1) assign labels
+            gls["label"], gnls["label"] = 1, 0
+
+            # 2) force both to the same CRS (use gls.crs here)
+            if gls.crs != gnls.crs:
+                gnls = gnls.to_crs(gls.crs)
+
+            # 3) now concatenate safely
+            merged = pd.concat([gls, gnls], ignore_index=True)
+            points = gpd.GeoDataFrame(merged,
+                                      geometry="geometry",
+                                      crs=gls.crs)
+
+            # 4) finally, reproject to your raster CRS
             points = points.to_crs(raster_crs)
+
 
 # ─── 3️⃣ SAMPLE RASTERS AT POINTS ──────────────────────────────────────────
 st.header("2️⃣ Sample Rasters at Points")
