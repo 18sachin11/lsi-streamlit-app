@@ -42,22 +42,57 @@ zip_ls     = st.file_uploader("Zipped Landslide (.zip):", type="zip")
 zip_nls    = st.file_uploader("Zipped Non-Landslide (.zip):", type="zip")
 preview    = st.checkbox("Preview rasters with legend & grid")
 
+# ─── SAFE SHAPEFILE UNZIP / LOAD ───────────────────────────────────────────
+# NOTE: we cache on the *bytes*, not on the UploadedFile object.
 @st.cache_data
-def unzip_shp(zf):
+def unzip_shp(z_bytes: bytes):
+    """
+    Unzip a shapefile ZIP (as raw bytes) and return a cleaned GeoDataFrame:
+    - searches recursively for .shp
+    - ensures non-empty
+    - ensures CRS is defined
+    - converts non-point geometries to centroids
+    """
+    if z_bytes is None:
+        return None
+
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, "upload.zip")
         with open(path, "wb") as f:
-            f.write(zf.getbuffer())
+            f.write(z_bytes)
+
         with zipfile.ZipFile(path, "r") as z:
             z.extractall(tmp)
-        shp_files = [os.path.join(tmp, f) for f in os.listdir(tmp) if f.endswith(".shp")]
-        return gpd.read_file(shp_files[0]) if shp_files else None
+
+        shp_files = []
+        for root, dirs, files in os.walk(tmp):
+            for f in files:
+                if f.lower().endswith(".shp"):
+                    shp_files.append(os.path.join(root, f))
+
+        if not shp_files:
+            raise FileNotFoundError("No .shp file found inside ZIP.")
+
+        gdf = gpd.read_file(shp_files[0])
+        if gdf.empty:
+            raise ValueError("Shapefile contains no features.")
+
+        if gdf.crs is None:
+            raise ValueError(
+                "Shapefile has no CRS defined (.prj missing). "
+                "Please define a CRS before uploading."
+            )
+
+        # If geometries are not Points, convert to centroids for sampling
+        if not all(gdf.geometry.geom_type == "Point"):
+            gdf = gdf.set_geometry(gdf.geometry.centroid)
+
+        return gdf
 
 # Load rasters
 rasters, meta, raster_crs = {}, None, None
 if layers_in and len(layers_in) == num_layers:
     for i, up in enumerate(layers_in, 1):
-        # Save to temp file, read, then delete
         tmpf = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
         tmpf.write(up.read())
         tmpf.flush()
@@ -73,7 +108,7 @@ if layers_in and len(layers_in) == num_layers:
                     nod = src.nodata
                     data_ma = np.ma.masked_equal(arr, nod) if nod is not None else np.ma.masked_invalid(arr)
                     # Reproject to WGS84 for grid
-                    if src.crs.to_epsg() != 4326:
+                    if src.crs and src.crs.to_epsg() != 4326:
                         t2, w2, h2 = calculate_default_transform(
                             src.crs, "EPSG:4326", src.width, src.height, *src.bounds
                         )
@@ -109,32 +144,54 @@ if layers_in and len(layers_in) == num_layers:
 
 # ─── 2️⃣ LOAD & REPROJECT POINTS ───────────────────────────────────────────
 points = None
-# Load & reproject point shapefiles
+
 if zip_ls and zip_nls:
     if raster_crs is None:
         st.error("Upload rasters first, then shapefiles.")
     else:
-        gls  = unzip_shp(zip_ls)
-        gnls = unzip_shp(zip_nls)
+        try:
+            # Read bytes from the uploaded files and pass to cached function
+            gls  = unzip_shp(zip_ls.read())
+            gnls = unzip_shp(zip_nls.read())
+        except Exception as e:
+            st.error(f"Error reading shapefiles: {e}")
+            gls, gnls = None, None
+
         if gls is None or gnls is None:
             st.error("Could not read shapefiles.")
         else:
             # 1) assign labels
             gls["label"], gnls["label"] = 1, 0
 
-            # 2) force both to the same CRS (use gls.crs here)
+            # 2) force both to the same CRS
             if gls.crs != gnls.crs:
-                gnls = gnls.to_crs(gls.crs)
+                try:
+                    gnls = gnls.to_crs(gls.crs)
+                except Exception as e:
+                    st.error(f"Error reprojecting non-landslide shapefile: {e}")
+                    gnls = None
 
-            # 3) now concatenate safely
-            merged = pd.concat([gls, gnls], ignore_index=True)
-            points = gpd.GeoDataFrame(merged,
-                                      geometry="geometry",
-                                      crs=gls.crs)
+            if gnls is not None:
+                merged = pd.concat([gls, gnls], ignore_index=True)
+                points = gpd.GeoDataFrame(
+                    merged,
+                    geometry="geometry",
+                    crs=gls.crs
+                )
 
-            # 4) finally, reproject to your raster CRS
-            points = points.to_crs(raster_crs)
-
+                # 4) finally, reproject to your raster CRS
+                if points.crs is None:
+                    st.error(
+                        "Points GeoDataFrame has no CRS. "
+                        "Please ensure shapefiles have a valid CRS."
+                    )
+                    points = None
+                else:
+                    try:
+                        points = points.to_crs(raster_crs)
+                    except Exception as e:
+                        st.error(f"Error reprojecting points to raster CRS: {e}")
+                        points = None
 
 # ─── 3️⃣ SAMPLE RASTERS AT POINTS ──────────────────────────────────────────
 st.header("2️⃣ Sample Rasters at Points")
@@ -142,21 +199,25 @@ df = None
 if points is not None and rasters:
     df = points.copy()
     feats = list(rasters.keys())
-    for key, (arr, tr, crs) in rasters.items():
-        vals = []
-        for pt in df.geometry:
-            try:
-                r, c = ~tr * (pt.x, pt.y)
-                vals.append(arr[int(r), int(c)])
-            except:
-                vals.append(np.nan)
-        df[key] = vals
+    try:
+        for key, (arr, tr, crs) in rasters.items():
+            vals = []
+            for pt in df.geometry:
+                try:
+                    r, c = ~tr * (pt.x, pt.y)
+                    vals.append(arr[int(r), int(c)])
+                except Exception:
+                    vals.append(np.nan)
+            df[key] = vals
 
-    # Drop any rows with NaN in any feature
-    df.dropna(subset=feats, inplace=True)
-    st.write(f"Sampled points: {df.shape[0]}")
-    if df.shape[0] < 2:
-        st.error("Need at least 2 valid samples.")
+        # Drop any rows with NaN in any feature
+        df.dropna(subset=feats, inplace=True)
+        st.write(f"Sampled points: {df.shape[0]}")
+        if df.shape[0] < 2:
+            st.error("Need at least 2 valid samples.")
+    except Exception as e:
+        st.error(f"Error while sampling rasters at points: {e}")
+        df = None
 else:
     st.info("Upload rasters & shapefiles to sample.")
 
@@ -243,7 +304,6 @@ if df is not None and df.shape[0] >= 2:
         mean_abs = np.abs(sv).mean(axis=0)
         pairs   = list(zip(feats, mean_abs.tolist()))
         shap_df = pd.DataFrame(pairs, columns=["layer","mean_abs_shap"]).sort_values("mean_abs_shap", ascending=False)
-        # only format the numeric column
         st.dataframe(shap_df.style.format({"mean_abs_shap":"{:.3f}"}))
 
         fig, ax = plt.subplots()
