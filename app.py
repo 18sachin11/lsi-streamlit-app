@@ -297,7 +297,7 @@ if df is not None and df.shape[0] >= 2:
         all_imp = pd.concat(imp_frames)
         pivot = all_imp.pivot(index="layer", columns="model", values="importance").fillna(0)
 
-        # 🔧 FIX: only format numeric columns to avoid list/str formatting errors
+        # Only format numeric columns to avoid list/str formatting errors
         numeric_cols = pivot.select_dtypes(include="number").columns
         fmt_dict = {col: "{:.3f}" for col in numeric_cols}
         st.dataframe(pivot.style.format(fmt_dict))
@@ -311,25 +311,45 @@ if df is not None and df.shape[0] >= 2:
             st.pyplot(fig)
             plt.close(fig)
 
-        # SHAP mean|value|
+        # ─── SHAP MEAN |VALUE| (OPTIONAL & SAMPLED) ─────────────────────────
         st.subheader("🔍 SHAP Mean |Value| Importance")
-        expl = shap.TreeExplainer(models[chosen[0]])
-        sv = expl.shap_values(Xtr)
-        if isinstance(sv, list):
-            sv = sv[1]
-        mean_abs = np.abs(sv).mean(axis=0)
-        pairs = list(zip(feats, mean_abs.tolist()))
-        shap_df = pd.DataFrame(pairs, columns=["layer", "mean_abs_shap"]).sort_values("mean_abs_shap", ascending=False)
+        run_shap = st.checkbox("Compute SHAP importances (can be slow)", value=False)
 
-        # this one already only formats the numeric column
-        st.dataframe(shap_df.style.format({"mean_abs_shap": "{:.3f}"}))
+        if run_shap:
+            max_shap_samples = 1000
+            if Xtr.shape[0] > max_shap_samples:
+                X_shap = Xtr.sample(max_shap_samples, random_state=42)
+            else:
+                X_shap = Xtr
 
-        fig, ax = plt.subplots()
-        ax.barh(shap_df["layer"], shap_df["mean_abs_shap"])
-        ax.set_title(f"SHAP Importances ({chosen[0]})")
-        ax.set_xlabel("Mean |SHAP value|")
-        st.pyplot(fig)
-        plt.close(fig)
+            try:
+                expl = shap.TreeExplainer(models[chosen[0]])
+                sv = expl.shap_values(X_shap)
+
+                # For tree models, shap_values can be a list [class0, class1]
+                if isinstance(sv, list):
+                    sv = sv[1]
+
+                mean_abs = np.abs(sv).mean(axis=0)
+                pairs = list(zip(feats, mean_abs.tolist()))
+                shap_df = (
+                    pd.DataFrame(pairs, columns=["layer", "mean_abs_shap"])
+                    .sort_values("mean_abs_shap", ascending=False)
+                )
+
+                st.dataframe(shap_df.style.format({"mean_abs_shap": "{:.3f}"}))
+
+                fig, ax = plt.subplots()
+                ax.barh(shap_df["layer"], shap_df["mean_abs_shap"])
+                ax.set_title(f"SHAP Importances ({chosen[0]})")
+                ax.set_xlabel("Mean |SHAP value|")
+                st.pyplot(fig)
+                plt.close(fig)
+
+            except Exception as e:
+                st.error(f"Could not compute SHAP values: {e}")
+        else:
+            st.info("SHAP computation skipped (enable the checkbox to compute, may be slow).")
 
         # ─── 5️⃣ FULL-AREA SUSCEPTIBILITY MAPS ─────────────────────────────────
         st.header("4️⃣ Full-Area Susceptibility Maps")
