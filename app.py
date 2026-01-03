@@ -92,7 +92,7 @@ rasters, meta, raster_crs = {}, None, None
 if layers_in and len(layers_in) == num_layers:
     for i, up in enumerate(layers_in, 1):
         # Use uploaded filename (without extension) as layer name
-        base_name = os.path.splitext(up.name)[0]  # e.g., "slope_30m.tif" -> "slope_30m"
+        base_name = os.path.splitext(up.name)[0]  # "slope_30m.tif" -> "slope_30m"
         layer_name = base_name.strip().replace(" ", "_")
 
         # Ensure unique key if duplicate names
@@ -296,7 +296,11 @@ if df is not None and df.shape[0] >= 2:
             )
         all_imp = pd.concat(imp_frames)
         pivot = all_imp.pivot(index="layer", columns="model", values="importance").fillna(0)
-        st.dataframe(pivot.style.format("{:.3f}"))
+
+        # 🔧 FIX: only format numeric columns to avoid list/str formatting errors
+        numeric_cols = pivot.select_dtypes(include="number").columns
+        fmt_dict = {col: "{:.3f}" for col in numeric_cols}
+        st.dataframe(pivot.style.format(fmt_dict))
 
         for name in chosen:
             sub = all_imp[all_imp["model"] == name].sort_values("importance", ascending=False)
@@ -316,6 +320,8 @@ if df is not None and df.shape[0] >= 2:
         mean_abs = np.abs(sv).mean(axis=0)
         pairs = list(zip(feats, mean_abs.tolist()))
         shap_df = pd.DataFrame(pairs, columns=["layer", "mean_abs_shap"]).sort_values("mean_abs_shap", ascending=False)
+
+        # this one already only formats the numeric column
         st.dataframe(shap_df.style.format({"mean_abs_shap": "{:.3f}"}))
 
         fig, ax = plt.subplots()
