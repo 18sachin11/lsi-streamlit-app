@@ -1,7 +1,6 @@
 import streamlit as st
 import geopandas as gpd
 import rasterio
-import rasterio.plot
 from rasterio.enums import Resampling
 from rasterio.warp import calculate_default_transform, reproject
 from rasterio.transform import array_bounds
@@ -43,7 +42,6 @@ zip_nls    = st.file_uploader("Zipped Non-Landslide (.zip):", type="zip")
 preview    = st.checkbox("Preview rasters with legend & grid")
 
 # ─── SAFE SHAPEFILE UNZIP / LOAD ───────────────────────────────────────────
-# NOTE: we cache on the *bytes*, not on the UploadedFile object.
 @st.cache_data
 def unzip_shp(z_bytes: bytes):
     """
@@ -89,10 +87,22 @@ def unzip_shp(z_bytes: bytes):
 
         return gdf
 
-# Load rasters
+# ─── LOAD RASTERS ─────────────────────────────────────────────────────────
 rasters, meta, raster_crs = {}, None, None
 if layers_in and len(layers_in) == num_layers:
     for i, up in enumerate(layers_in, 1):
+        # Use uploaded filename (without extension) as layer name
+        base_name = os.path.splitext(up.name)[0]  # e.g., "slope_30m.tif" -> "slope_30m"
+        layer_name = base_name.strip().replace(" ", "_")
+
+        # Ensure unique key if duplicate names
+        original_layer_name = layer_name
+        counter = 1
+        while layer_name in rasters:
+            layer_name = f"{original_layer_name}_{counter}"
+            counter += 1
+
+        # Save to temp file, read, then delete
         tmpf = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
         tmpf.write(up.read())
         tmpf.flush()
@@ -100,7 +110,7 @@ if layers_in and len(layers_in) == num_layers:
         try:
             with rasterio.open(tmpf.name) as src:
                 arr = src.read(1)
-                rasters[f"layer_{i}"] = (arr, src.transform, src.crs)
+                rasters[layer_name] = (arr, src.transform, src.crs)
                 if meta is None:
                     meta, raster_crs = src.meta.copy(), src.crs
 
@@ -124,13 +134,13 @@ if layers_in and len(layers_in) == num_layers:
                     else:
                         left, bottom, right, top = src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top
 
-                    fig, ax = plt.subplots(figsize=(4,3))
+                    fig, ax = plt.subplots(figsize=(4, 3))
                     im = ax.imshow(
                         data_ma, cmap="terrain", origin="upper",
                         extent=[left, right, bottom, top], interpolation="none"
                     )
                     cbar = plt.colorbar(im, ax=ax, shrink=0.75)
-                    cbar.set_label(f"Layer {i}")
+                    cbar.set_label(layer_name)
                     xt = np.round(np.linspace(left, right, 5), 2)
                     yt = np.round(np.linspace(bottom, top, 5), 2)
                     ax.set_xticks(xt); ax.set_yticks(yt)
@@ -150,7 +160,6 @@ if zip_ls and zip_nls:
         st.error("Upload rasters first, then shapefiles.")
     else:
         try:
-            # Read bytes from the uploaded files and pass to cached function
             gls  = unzip_shp(zip_ls.read())
             gnls = unzip_shp(zip_nls.read())
         except Exception as e:
@@ -229,7 +238,10 @@ if df is not None and df.shape[0] >= 2:
 
     # Drop zero-variance features
     vt = VarianceThreshold(threshold=0.0)
-    X = pd.DataFrame(vt.fit_transform(X), columns=[f for f,c in zip(feats, vt.get_support()) if c])
+    X = pd.DataFrame(
+        vt.fit_transform(X),
+        columns=[f for f, c in zip(feats, vt.get_support()) if c]
+    )
     feats = list(X.columns)
 
     Xtr, Xte, ytr, yte = train_test_split(
@@ -249,25 +261,25 @@ if df is not None and df.shape[0] >= 2:
             m = models[name]
             m.fit(Xtr, ytr)
             pred = m.predict(Xte)
-            pr   = m.predict_proba(Xte)[:,1]
+            pr   = m.predict_proba(Xte)[:, 1]
             results[name] = pr
 
             st.subheader(f"{name} Report")
             st.text(classification_report(yte, pred))
 
             cm = confusion_matrix(yte, pred)
-            fig, ax = plt.subplots(figsize=(3,2))
+            fig, ax = plt.subplots(figsize=(3, 2))
             sns.heatmap(cm, annot=True, fmt="d", ax=ax)
             ax.set_title(f"{name} Confusion")
             st.pyplot(fig)
             plt.close(fig)
 
         # ROC curves
-        fig, ax = plt.subplots(figsize=(5,4))
+        fig, ax = plt.subplots(figsize=(5, 4))
         for name, pr in results.items():
             fpr, tpr, _ = roc_curve(yte, pr)
-            ax.plot(fpr, tpr, label=f"{name} (AUC={auc(fpr,tpr):.2f})")
-        ax.plot([0,1],[0,1],'--',color='gray')
+            ax.plot(fpr, tpr, label=f"{name} (AUC={auc(fpr, tpr):.2f})")
+        ax.plot([0, 1], [0, 1], '--', color='gray')
         ax.legend()
         st.pyplot(fig)
         plt.close(fig)
@@ -283,11 +295,11 @@ if df is not None and df.shape[0] >= 2:
                 pd.DataFrame({"layer": feats, "importance": fi, "model": name})
             )
         all_imp = pd.concat(imp_frames)
-        pivot  = all_imp.pivot(index="layer", columns="model", values="importance").fillna(0)
+        pivot = all_imp.pivot(index="layer", columns="model", values="importance").fillna(0)
         st.dataframe(pivot.style.format("{:.3f}"))
 
         for name in chosen:
-            sub = all_imp[all_imp["model"]==name].sort_values("importance", ascending=False)
+            sub = all_imp[all_imp["model"] == name].sort_values("importance", ascending=False)
             fig, ax = plt.subplots()
             ax.barh(sub["layer"], sub["importance"])
             ax.set_title(f"{name} Feature Importances")
@@ -298,13 +310,13 @@ if df is not None and df.shape[0] >= 2:
         # SHAP mean|value|
         st.subheader("🔍 SHAP Mean |Value| Importance")
         expl = shap.TreeExplainer(models[chosen[0]])
-        sv   = expl.shap_values(Xtr)
+        sv = expl.shap_values(Xtr)
         if isinstance(sv, list):
             sv = sv[1]
         mean_abs = np.abs(sv).mean(axis=0)
-        pairs   = list(zip(feats, mean_abs.tolist()))
-        shap_df = pd.DataFrame(pairs, columns=["layer","mean_abs_shap"]).sort_values("mean_abs_shap", ascending=False)
-        st.dataframe(shap_df.style.format({"mean_abs_shap":"{:.3f}"}))
+        pairs = list(zip(feats, mean_abs.tolist()))
+        shap_df = pd.DataFrame(pairs, columns=["layer", "mean_abs_shap"]).sort_values("mean_abs_shap", ascending=False)
+        st.dataframe(shap_df.style.format({"mean_abs_shap": "{:.3f}"}))
 
         fig, ax = plt.subplots()
         ax.barh(shap_df["layer"], shap_df["mean_abs_shap"])
@@ -330,10 +342,10 @@ if df is not None and df.shape[0] >= 2:
         # align rasters
         aligned = {}
         for k, (arr, tr, crs) in rasters.items():
-            if arr.shape==(h,w) and tr==ref_tr and crs==ref_crs:
+            if arr.shape == (h, w) and tr == ref_tr and crs == ref_crs:
                 aligned[k] = arr
             else:
-                dst = np.empty((h,w), dtype=arr.dtype)
+                dst = np.empty((h, w), dtype=arr.dtype)
                 reproject(
                     source=arr, destination=dst,
                     src_transform=tr, src_crs=crs,
@@ -343,7 +355,7 @@ if df is not None and df.shape[0] >= 2:
                 aligned[k] = dst
 
         stack = np.column_stack([aligned[k].flatten() for k in feats])
-        mask  = np.any(np.isnan(stack), axis=1)
+        mask = np.any(np.isnan(stack), axis=1)
         valid = stack[~mask]
         valid_df = pd.DataFrame(valid, columns=feats)
 
@@ -352,30 +364,33 @@ if df is not None and df.shape[0] >= 2:
 
         ensemble = []
         for name in chosen:
-            m     = models[name]
-            probs = m.predict_proba(valid_df)[:,1]
+            m = models[name]
+            probs = m.predict_proba(valid_df)[:, 1]
 
-            full  = np.full(stack.shape[0], np.nan, dtype="float32")
+            full = np.full(stack.shape[0], np.nan, dtype="float32")
             full[~mask] = probs
-            full = full.reshape((h,w))
+            full = full.reshape((h, w))
             full[np.isnan(full)] = -9999.0
 
-            path = f"{name.replace(' ','_')}_LSI.tif"
+            path = f"{name.replace(' ', '_')}_LSI.tif"
             with rasterio.open(path, "w", **out_meta) as dst:
                 dst.write(full, 1)
             ensemble.append(full)
 
             st.subheader(f"{name} Susceptibility Map")
-            fig, ax = plt.subplots(figsize=(5,4))
-            img = ax.imshow(full, cmap="RdYlBu", vmin=0, vmax=1,
-                            extent=[lon_min, lon_max, lat_min, lat_max],
-                            origin="upper")
+            fig, ax = plt.subplots(figsize=(5, 4))
+            img = ax.imshow(
+                full, cmap="RdYlBu", vmin=0, vmax=1,
+                extent=[lon_min, lon_max, lat_min, lat_max],
+                origin="upper"
+            )
             cbar = plt.colorbar(img, ax=ax, shrink=0.75)
             cbar.set_label("Susceptibility")
             ax.set_xticks(xt); ax.set_yticks(yt)
             ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
             ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
-            ax.set_xlabel("Longitude (°)"); ax.set_ylabel("Latitude (°)")
+            ax.set_xlabel("Longitude (°)")
+            ax.set_ylabel("Latitude (°)")
             ax.grid(True, linestyle="--", alpha=0.5)
             st.pyplot(fig)
             plt.close(fig)
@@ -383,15 +398,18 @@ if df is not None and df.shape[0] >= 2:
         # ensemble mean
         st.subheader("🧮 Ensemble Mean Map")
         mean_map = np.nanmean(np.stack(ensemble), axis=0)
-        fig, ax = plt.subplots(figsize=(5,4))
-        img = ax.imshow(mean_map, cmap="RdYlBu", vmin=0, vmax=1,
-                        extent=[lon_min, lon_max, lat_min, lat_max],
-                        origin="upper")
+        fig, ax = plt.subplots(figsize=(5, 4))
+        img = ax.imshow(
+            mean_map, cmap="RdYlBu", vmin=0, vmax=1,
+            extent=[lon_min, lon_max, lat_min, lat_max],
+            origin="upper"
+        )
         plt.colorbar(img, ax=ax, shrink=0.75).set_label("Susceptibility")
         ax.set_xticks(xt); ax.set_yticks(yt)
         ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
-        ax.set_xlabel("Longitude (°)"); ax.set_ylabel("Latitude (°)")
+        ax.set_xlabel("Longitude (°)")
+        ax.set_ylabel("Latitude (°)")
         ax.grid(True, linestyle="--", alpha=0.5)
         st.pyplot(fig)
         plt.close(fig)
@@ -400,8 +418,9 @@ if df is not None and df.shape[0] >= 2:
         zip_name = "LSI_maps.zip"
         with zipfile.ZipFile(zip_name, "w") as zf:
             for name in chosen:
-                tif = f"{name.replace(' ','_')}_LSI.tif"
-                zf.write(tif)
+                tif = f"{name.replace(' ', '_')}_LSI.tif"
+                if os.path.exists(tif):
+                    zf.write(tif)
         with open(zip_name, "rb") as f:
             st.download_button("📥 Download All Maps", f, file_name=zip_name)
         os.remove(zip_name)
